@@ -51,4 +51,89 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_index_rounds_one_active
     ON index_build_rounds ((1))
     WHERE status IN ('running', 'cancel_requested');
 
+-- 3) 报告变更轨迹表（审计）。
+-- 从功能启用起，reports 上每一次已提交的补录(INSERT)/更正(UPDATE)/删除(DELETE)
+-- 都由行级触发器在此记录变更前、变更后的完整行；轨迹与原行在同一事务提交，
+-- 回滚则两者一起消失，不留记录。report_id 即 reports.id：唯一索引生效前
+-- 同报告号的多行各按 id 独立成轨；报告删除后轨迹仍保留，故不设外键。
+CREATE TABLE IF NOT EXISTS report_changes (
+    id               BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    report_id        BIGINT      NOT NULL,  -- reports.id（业务主键流水号）
+    change_no        INTEGER     NOT NULL,  -- 报告内变更编号：从 1 起按实际生效顺序递增
+    op               TEXT        NOT NULL CHECK (op IN ('INSERT', 'UPDATE', 'DELETE')),
+    changed_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    txid             BIGINT      NOT NULL,  -- 提交事务 ID，同事务的多行变更可据此关联
+    changed_by       TEXT        NOT NULL,  -- 执行改动的数据库用户
+    application_name TEXT        NOT NULL DEFAULT '',  -- 来源应用（reports-api / psql / 脚本等）
+    old_row          JSONB,                 -- 变更前完整行（INSERT 为 NULL）
+    new_row          JSONB,                 -- 变更后完整行（DELETE 为 NULL）
+    UNIQUE (report_id, change_no)           -- 兜底：同一报告内编号绝不重复
+);
+
+COMMENT ON TABLE  report_changes              IS 'reports 已提交变更轨迹：补录/更正/删除的前后完整行（触发器写入，与原行同事务）';
+COMMENT ON COLUMN report_changes.report_id    IS 'reports.id；唯一索引未生效时同报告号多行按 id 各自成轨';
+COMMENT ON COLUMN report_changes.change_no    IS '报告内变更编号，从 1 起按实际生效顺序递增；回滚不留号';
+COMMENT ON COLUMN report_changes.op           IS 'INSERT 补录 / UPDATE 更正 / DELETE 删除';
+COMMENT ON COLUMN report_changes.txid         IS '提交事务 ID（txid_current()）';
+COMMENT ON COLUMN report_changes.old_row      IS '变更前完整行（JSONB）；INSERT 时为 NULL；旧库已有行首次改动时即改动前的值';
+COMMENT ON COLUMN report_changes.new_row      IS '变更后完整行（JSONB）；DELETE 时为 NULL';
+
+-- 4) 行级审计触发器：AFTER 触发，与原行同事务写入轨迹。
+-- 编号取“该报告已提交的最大编号 + 1”：同一报告的并发改动被 reports 行锁串行化，
+-- 后生效的事务解除阻塞后才执行触发器，能读到先生效事务已提交的编号，
+-- 因此 change_no 的顺序就是改动实际生效的顺序；回滚事务的编号随事务消失，
+-- 后续改动会复用该号，不留空洞、不留未提交的值。
+CREATE OR REPLACE FUNCTION log_report_change() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_report_id BIGINT;
+    v_next_no   INTEGER;
+BEGIN
+    v_report_id := COALESCE(NEW.id, OLD.id);
+
+    SELECT COALESCE(MAX(c.change_no), 0) + 1
+      INTO v_next_no
+      FROM report_changes c
+     WHERE c.report_id = v_report_id;
+
+    INSERT INTO report_changes
+        (report_id, change_no, op, txid, changed_by, application_name, old_row, new_row)
+    VALUES (
+        v_report_id,
+        v_next_no,
+        TG_OP,
+        txid_current(),
+        current_user,
+        current_setting('application_name'),
+        CASE WHEN TG_OP <> 'INSERT' THEN to_jsonb(OLD) END,
+        CASE WHEN TG_OP <> 'DELETE' THEN to_jsonb(NEW) END
+    );
+
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+-- 5) 禁止 TRUNCATE：它绕过行级触发器，会让删除不留轨迹。
+-- 需要清空时请用 DELETE（逐行记录轨迹）。
+CREATE OR REPLACE FUNCTION forbid_reports_truncate() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'TRUNCATE reports 被禁止：删除必须留变更轨迹，请改用 DELETE';
+END;
+$$;
+
+-- PostgreSQL 的 CREATE TRIGGER 没有 IF NOT EXISTS，用 DROP + CREATE 保证幂等。
+DROP TRIGGER IF EXISTS reports_audit ON reports;
+CREATE TRIGGER reports_audit
+AFTER INSERT OR UPDATE OR DELETE ON reports
+FOR EACH ROW EXECUTE FUNCTION log_report_change();
+
+DROP TRIGGER IF EXISTS reports_no_truncate ON reports;
+CREATE TRIGGER reports_no_truncate
+BEFORE TRUNCATE ON reports
+FOR EACH STATEMENT EXECUTE FUNCTION forbid_reports_truncate();
+
 COMMIT;

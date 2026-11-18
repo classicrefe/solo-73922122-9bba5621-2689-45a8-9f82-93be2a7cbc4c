@@ -22,7 +22,8 @@ def init_pool() -> None:
             settings.database_url,
             min_size=2,
             max_size=10,
-            kwargs={"row_factory": dict_row},
+            # application_name 写入变更轨迹，便于区分 API 写入与独立 SQL。
+            kwargs={"row_factory": dict_row, "application_name": "reports-api"},
             open=True,
         )
 
@@ -47,6 +48,41 @@ def ensure_schema() -> None:
     with pool().connection() as conn:
         conn.execute(ddl)
         conn.commit()
+
+
+# ----------------------------- 变更轨迹（审计） -----------------------------
+
+def audit_objects_exist(conn: psycopg.Connection) -> bool:
+    """审计对象（report_changes 表 + reports_audit 触发器）是否都已就绪。"""
+    has_table = conn.execute(
+        "SELECT to_regclass('public.report_changes') IS NOT NULL AS ok"
+    ).fetchone()["ok"]
+    if not has_table:
+        return False
+    has_reports = conn.execute(
+        "SELECT to_regclass('public.reports') IS NOT NULL AS ok"
+    ).fetchone()["ok"]
+    if not has_reports:
+        return False
+    return bool(conn.execute(
+        "SELECT EXISTS (SELECT 1 FROM pg_trigger "
+        " WHERE tgname = 'reports_audit' "
+        "   AND tgrelid = 'public.reports'::regclass) AS ok"
+    ).fetchone()["ok"])
+
+
+def ensure_audit_schema() -> None:
+    """审计对象缺失时执行幂等 DDL（01_schema.sql 全量幂等，含建表与触发器）。
+
+    已就绪则完全不执行 DDL：避免启动期因 DDL 锁与未提交写事务相互阻塞
+    （与 service.reconcile_on_startup 的考虑一致）。旧库升级时在此补齐
+    report_changes 与触发器；启用前已存在的报告行，其首次改动的前值
+    由触发器的 OLD 整行捕获，无需回填。
+    """
+    with pool().connection() as conn:
+        ok = audit_objects_exist(conn)
+    if not ok:
+        ensure_schema()
 
 
 # ----------------------------- 索引状态 ---------------------------------
@@ -133,5 +169,45 @@ def get_round_by_id(conn: psycopg.Connection, round_id: str) -> dict[str, Any] |
 def latest_round(conn: psycopg.Connection) -> dict[str, Any] | None:
     row = conn.execute(
         "SELECT * FROM index_build_rounds ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    return dict(row) if row else None
+
+
+# ----------------------------- 变更轨迹查询 -----------------------------
+
+def list_report_changes(
+    conn: psycopg.Connection, report_id: int, limit: int, offset: int
+) -> tuple[int, list[dict[str, Any]]]:
+    """按 reports.id 列出已提交变更轨迹（change_no 升序）。返回 (总数, 明细)。"""
+    total = conn.execute(
+        "SELECT count(*) AS n FROM report_changes WHERE report_id = %s",
+        (report_id,),
+    ).fetchone()["n"]
+    rows = conn.execute(
+        """
+        SELECT change_no, op, changed_at, txid, changed_by, application_name,
+               old_row, new_row
+        FROM report_changes
+        WHERE report_id = %s
+        ORDER BY change_no
+        LIMIT %s OFFSET %s
+        """,
+        (report_id, limit, offset),
+    ).fetchall()
+    return total, [dict(r) for r in rows]
+
+
+def get_report_change(
+    conn: psycopg.Connection, report_id: int, change_no: int
+) -> dict[str, Any] | None:
+    """取该报告指定变更编号的一条轨迹；不存在返回 None。"""
+    row = conn.execute(
+        """
+        SELECT change_no, op, changed_at, txid, changed_by, application_name,
+               old_row, new_row
+        FROM report_changes
+        WHERE report_id = %s AND change_no = %s
+        """,
+        (report_id, change_no),
     ).fetchone()
     return dict(row) if row else None

@@ -19,7 +19,9 @@ source ./common.sh
 
 echo "== 1. 清理并准备数据 =="
 psql_exec -c "DROP INDEX IF EXISTS uq_reports_lab_no_report_no;" \
-          -c "TRUNCATE reports RESTART IDENTITY;" \
+          -c "DELETE FROM reports;" \
+          -c "TRUNCATE report_changes RESTART IDENTITY;" \
+          -c "ALTER TABLE reports ALTER COLUMN id RESTART;" \
           -c "DELETE FROM index_build_rounds;" >/dev/null
 psql_exec -c "INSERT INTO reports(lab_no,report_no,measured)
               SELECT 'LAB','R-'||g, g FROM generate_series(1,20) g;"
@@ -54,7 +56,8 @@ while time.time() < deadline and not (sig / "commit").exists():
 conn.commit(); conn.close()
 PY
 BF_HOLDER=$!
-for _ in $(seq 1 20); do [[ -f "$BF_SIG/pid" ]] && break; sleep 0.3; doneBACKFILL_PID="$(cat "$BF_SIG/pid")"
+for _ in $(seq 1 20); do [[ -f "$BF_SIG/pid" ]] && break; sleep 0.3; done
+BACKFILL_PID="$(cat "$BF_SIG/pid")"
 echo "补录事务 PID = $BACKFILL_PID（取消后应依然存活）"
 
 echo "== 4. 取消：先得到 202 cancel_requested（绝不提前报 cancelled） =="
@@ -86,7 +89,9 @@ esac
 
 echo "== 7. 合成“后端已停止 + 无效索引 + cancel_requested”，演示确认停止后才 cancelled 并清理 =="
 psql_exec -c "DROP INDEX IF EXISTS uq_reports_lab_no_report_no;" \
-          -c "TRUNCATE reports RESTART IDENTITY;" \
+          -c "DELETE FROM reports;" \
+          -c "TRUNCATE report_changes RESTART IDENTITY;" \
+          -c "ALTER TABLE reports ALTER COLUMN id RESTART;" \
           -c "DELETE FROM index_build_rounds;" >/dev/null
 psql_exec -c "INSERT INTO reports(lab_no,report_no,measured) VALUES ('D','K',1),('D','K',2);"
 # 必然失败的 CIC：留下无效索引，后端随即结束。

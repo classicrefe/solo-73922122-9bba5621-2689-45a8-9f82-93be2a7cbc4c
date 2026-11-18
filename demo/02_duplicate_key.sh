@@ -6,7 +6,9 @@ source ./common.sh
 
 echo "== 1. 清理并制造重复 (lab_no, report_no) 数据 =="
 psql_exec -c "DROP INDEX IF EXISTS uq_reports_lab_no_report_no;" \
-          -c "TRUNCATE reports RESTART IDENTITY;" \
+          -c "DELETE FROM reports;" \
+          -c "TRUNCATE report_changes RESTART IDENTITY;" \
+          -c "ALTER TABLE reports ALTER COLUMN id RESTART;" \
           -c "DELETE FROM index_build_rounds;" >/dev/null
 psql_exec -c "
 INSERT INTO reports(lab_no, report_no, measured) VALUES

@@ -1,15 +1,21 @@
-"""FastAPI 入口：补录、唯一索引构建的发起/查询/取消。"""
+"""FastAPI 入口：补录、变更轨迹查询、唯一索引构建的发起/查询/取消。"""
 from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
 
 import psycopg
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Query, status
 
 from . import db
 from .responses import AppJSONResponse
-from .schemas import BatchReportIn, ReportIn, ReportOut
+from .schemas import (
+    BatchReportIn,
+    ChangeListOut,
+    ReportIn,
+    ReportOut,
+    ReportStateAtChangeOut,
+)
 from .service import service
 
 logging.basicConfig(
@@ -22,6 +28,8 @@ log = logging.getLogger("api")
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     db.init_pool()
+    # 审计对象（report_changes + 触发器）缺失时补齐；已就绪则不执行任何 DDL。
+    db.ensure_audit_schema()
     service.reconcile_on_startup()
     try:
         yield
@@ -35,8 +43,10 @@ app = FastAPI(
         "对持续补录的 reports 表在线构建 (lab_no, report_no) 唯一索引；"
         "支持发起、查询、取消 CREATE UNIQUE INDEX CONCURRENTLY，"
         "构建期间补录不阻塞，API 重启后接续跟踪。"
+        "reports 的补录/更正/删除由数据库触发器记录变更前后完整行，"
+        "可按 reports.id 查询已提交变更轨迹、按变更编号查看当时生效的整行。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     default_response_class=AppJSONResponse,
     lifespan=lifespan,
 )
@@ -110,6 +120,64 @@ def list_reports(limit: int = 50, offset: int = 0):
         ).fetchall()
         total = conn.execute("SELECT count(*) AS n FROM reports").fetchone()["n"]
     return {"total": total, "items": [dict(r) for r in rows]}
+
+
+# --------------------------- 变更轨迹（审计） ----------------------------
+
+@app.get("/reports/{report_id}/changes", response_model=ChangeListOut)
+def list_report_changes(
+    report_id: int,
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+):
+    """按 reports.id 查询已提交的变更轨迹（补录/更正/删除，含变更前后完整行）。
+
+    轨迹由数据库触发器与原行同事务写入：独立 SQL 与 API 写入均覆盖，
+    回滚不留记录；change_no 从 1 起按实际生效顺序编号。
+    唯一索引未生效时，同报告号的多行按各自 id 独立成轨。
+    """
+    with db.pool().connection() as conn:
+        total, items = db.list_report_changes(conn, report_id, limit, offset)
+    return {"report_id": report_id, "total": total, "items": items}
+
+
+@app.get("/reports/{report_id}/changes/{change_no}",
+         response_model=ReportStateAtChangeOut)
+def get_report_state_at_change(report_id: int, change_no: int):
+    """按报告 ID 和变更编号查看当时生效的整行（即该变更生效后的行状态）。
+
+    该编号对应删除（DELETE）时，行自彼时起不存在，返回 404。
+    """
+    with db.pool().connection() as conn:
+        change = db.get_report_change(conn, report_id, change_no)
+    if change is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": "change_not_found",
+                "message": "该报告不存在此变更编号（或报告从未有已提交变更）",
+                "report_id": report_id,
+                "change_no": change_no,
+            },
+        )
+    if change["op"] == "DELETE":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": "report_deleted",
+                "message": "该变更编号对应删除操作，报告行自彼时起不存在；"
+                           "删除前的完整行见 GET /reports/{id}/changes 中该条的 old_row",
+                "report_id": report_id,
+                "change_no": change_no,
+            },
+        )
+    return {
+        "report_id": report_id,
+        "change_no": change["change_no"],
+        "op": change["op"],
+        "changed_at": change["changed_at"],
+        "row": change["new_row"],
+    }
 
 
 # --------------------------- 唯一索引构建 --------------------------------
